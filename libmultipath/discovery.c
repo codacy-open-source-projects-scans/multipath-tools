@@ -34,6 +34,7 @@
 #include "configure.h"
 #include "print.h"
 #include "strbuf.h"
+#include "pgpolicies.h"
 
 #define VPD_BUFLEN 4096
 
@@ -146,7 +147,7 @@ path_discover (vector pathvec, struct config * conf,
 		return pathinfo(pp, conf, flag);
 }
 
-static void cleanup_udev_enumerate_ptr(void *arg)
+void cleanup_udev_enumerate_ptr(void *arg)
 {
 	struct udev_enumerate *ue;
 
@@ -157,7 +158,7 @@ static void cleanup_udev_enumerate_ptr(void *arg)
 		(void)udev_enumerate_unref(ue);
 }
 
-static void cleanup_udev_device_ptr(void *arg)
+void cleanup_udev_device_ptr(void *arg)
 {
 	struct udev_device *ud;
 
@@ -875,7 +876,7 @@ sysfs_set_nexus_loss_tmo(struct path *pp)
 static void
 scsi_tmo_error_msg(struct path *pp)
 {
-	STATIC_BITFIELD(bf, LAST_BUS_PROTOCOL_ID + 1);
+	static BITFIELD(bf, LAST_BUS_PROTOCOL_ID + 1);
 	STRBUF_ON_STACK(proto_buf);
 	unsigned int proto_id = bus_protocol_id(pp);
 
@@ -942,7 +943,7 @@ sysfs_set_scsi_tmo (struct config *conf, struct multipath *mpp)
 			continue;
 		}
 
-		if (pp->dev_loss == DEV_LOSS_TMO_UNSET)
+		if (pp->dev_loss == DEV_LOSS_TMO_UNSET && min_dev_loss != 0)
 			pp->dev_loss = min_dev_loss;
 		else if (pp->dev_loss < min_dev_loss) {
 			pp->dev_loss = min_dev_loss;
@@ -1076,18 +1077,16 @@ detect_alua(struct path * pp)
 		return;
 	}
 
-	if (pp->fd == -1 || pp->offline)
+	if (pp->fd == -1 || pp->sysfs_state == PATH_DOWN)
 		return;
 
 	ret = get_target_port_group(pp);
 	if (ret < 0 || get_asymmetric_access_state(pp, ret) < 0) {
-		int state;
-
 		if (ret == -RTPG_INQUIRY_FAILED)
 			return;
 
-		state = path_offline(pp);
-		if (state != PATH_UP)
+		path_sysfs_state(pp);
+		if (pp->sysfs_state != PATH_UP)
 			return;
 
 		pp->tpgs = TPGS_NONE;
@@ -1099,8 +1098,13 @@ detect_alua(struct path * pp)
 
 int path_get_tpgs(struct path *pp)
 {
-	if (pp->tpgs == TPGS_UNDEF)
+	if (pp->tpgs == TPGS_UNDEF) {
 		detect_alua(pp);
+		if (pp->tpgs != TPGS_UNDEF && pp->tpg_id != GROUP_ID_UNDEF &&
+		    pp->mpp &&
+		    pp->mpp->pgpolicyfn == (pgpolicyfn *)group_by_tpg)
+			pp->mpp->need_reload = true;
+	}
 	return pp->tpgs;
 }
 
@@ -1529,23 +1533,16 @@ scsi_sysfs_pathinfo (struct path *pp, const struct vector_s *hwtable)
 	const char *attr_path = NULL;
 	static const char unknown[] = "UNKNOWN";
 
-	parent = pp->udev;
-	while (parent) {
-		const char *subsys = udev_device_get_subsystem(parent);
-		if (subsys && !strncmp(subsys, "scsi", 4)) {
-			attr_path = udev_device_get_sysname(parent);
-			if (!attr_path)
-				break;
-			if (sscanf(attr_path, "%i:%i:%i:%" SCNu64,
-				   &pp->sg_id.host_no,
-				   &pp->sg_id.channel,
-				   &pp->sg_id.scsi_id,
-				   &pp->sg_id.lun) == 4)
-				break;
-		}
-		parent = udev_device_get_parent(parent);
-	}
-	if (!attr_path || pp->sg_id.host_no == -1)
+	parent = udev_device_get_parent_with_subsystem_devtype(pp->udev, "scsi",
+							       "scsi_device");
+	if (!parent)
+		return PATHINFO_FAILED;
+	attr_path = udev_device_get_sysname(parent);
+	if (!attr_path)
+		return PATHINFO_FAILED;
+	if (sscanf(attr_path, "%i:%i:%i:%" SCNu64,
+		   &pp->sg_id.host_no,
+		   &pp->sg_id.channel, &pp->sg_id.scsi_id, &pp->sg_id.lun) != 4)
 		return PATHINFO_FAILED;
 
 	if (sysfs_get_vendor(parent, pp->vendor_id, SCSI_VENDOR_SIZE) <= 0) {
@@ -1589,6 +1586,9 @@ scsi_sysfs_pathinfo (struct path *pp, const struct vector_s *hwtable)
 
 	condlog(3, "%s: tgt_node_name = %s",
 		pp->dev, pp->tgt_node_name);
+
+	if (get_vpd_sysfs(parent, 0x80, pp->serial, SERIAL_SIZE) > 0)
+		condlog(3, "%s: serial = %s (sysfs)", pp->dev, pp->serial);
 
 	return PATHINFO_OK;
 }
@@ -1669,6 +1669,7 @@ ccw_sysfs_pathinfo (struct path *pp, const struct vector_s *hwtable)
 	if (!parent)
 		return PATHINFO_FAILED;
 
+	// Identified as IBM, but any other PAV array vendor is also supported
 	sprintf(pp->vendor_id, "IBM");
 
 	condlog(3, "%s: vendor = %s", pp->dev, pp->vendor_id);
@@ -1800,7 +1801,7 @@ common_sysfs_pathinfo (struct path * pp)
 }
 
 int
-path_offline (struct path * pp)
+path_sysfs_state(struct path * pp)
 {
 	struct udev_device * parent;
 	char buff[SCSI_STATE_SIZE];
@@ -1814,7 +1815,8 @@ path_offline (struct path * pp)
 		subsys_type = "nvme";
 	}
 	else {
-		return PATH_UP;
+		pp->sysfs_state = PATH_UP;
+		goto out;
 	}
 
 	parent = pp->udev;
@@ -1827,16 +1829,18 @@ path_offline (struct path * pp)
 
 	if (!parent) {
 		condlog(1, "%s: failed to get sysfs information", pp->dev);
-		return PATH_REMOVED;
+		pp->sysfs_state = PATH_REMOVED;
+		goto out;
 	}
 
 	memset(buff, 0x0, SCSI_STATE_SIZE);
 	err = sysfs_attr_get_value(parent, "state", buff, sizeof(buff));
 	if (!sysfs_attr_value_ok(err, sizeof(buff))) {
 		if (err == -ENXIO)
-			return PATH_REMOVED;
+			pp->sysfs_state = PATH_REMOVED;
 		else
-			return PATH_DOWN;
+			pp->sysfs_state = PATH_DOWN;
+		goto out;
 	}
 
 
@@ -1844,31 +1848,34 @@ path_offline (struct path * pp)
 
 	if (pp->bus == SYSFS_BUS_SCSI) {
 		if (!strncmp(buff, "offline", 7)) {
-			pp->offline = 1;
-			return PATH_DOWN;
+			pp->sysfs_state = PATH_DOWN;
+			goto out;
+		} else if (!strncmp(buff, "blocked", 7) ||
+			   !strncmp(buff, "quiesce", 7)) {
+			pp->sysfs_state = PATH_PENDING;
+			goto out;
+		} else if (!strncmp(buff, "running", 7)) {
+			pp->sysfs_state = PATH_UP;
+			goto out;
 		}
-		pp->offline = 0;
-		if (!strncmp(buff, "blocked", 7) ||
-		    !strncmp(buff, "quiesce", 7))
-			return PATH_PENDING;
-		else if (!strncmp(buff, "running", 7))
-			return PATH_UP;
 
 	}
 	else if (pp->bus == SYSFS_BUS_NVME) {
 		if (!strncmp(buff, "dead", 4)) {
-			pp->offline = 1;
-			return PATH_DOWN;
+			pp->sysfs_state = PATH_DOWN;
+			goto out;
+		} else if (!strncmp(buff, "new", 3) ||
+			   !strncmp(buff, "deleting", 8)) {
+			pp->sysfs_state = PATH_PENDING;
+			goto out;
+		} else if (!strncmp(buff, "live", 4)) {
+			pp->sysfs_state = PATH_UP;
+			goto out;
 		}
-		pp->offline = 0;
-		if (!strncmp(buff, "new", 3) ||
-		    !strncmp(buff, "deleting", 8))
-			return PATH_PENDING;
-		else if (!strncmp(buff, "live", 4))
-			return PATH_UP;
 	}
-
-	return PATH_DOWN;
+	pp->sysfs_state = PATH_DOWN;
+out:
+	return pp->sysfs_state;
 }
 
 static int
@@ -1908,14 +1915,9 @@ sysfs_pathinfo(struct path *pp, const struct vector_s *hwtable)
 }
 
 static void
-scsi_ioctl_pathinfo (struct path * pp, int mask)
+scsi_ioctl_pathinfo (struct path * pp)
 {
-	struct udev_device *parent;
-	const char *attr_path = NULL;
 	int vpd_id;
-
-	if (!(mask & DI_SERIAL))
-		return;
 
 	select_vpd_vendor_id(pp);
 	vpd_id = pp->vpd_vendor_id;
@@ -1936,34 +1938,13 @@ scsi_ioctl_pathinfo (struct path * pp, int mask)
 		}
 	}
 
-	parent = pp->udev;
-	while (parent) {
-		const char *subsys = udev_device_get_subsystem(parent);
-		if (subsys && !strncmp(subsys, "scsi", 4)) {
-			attr_path = udev_device_get_sysname(parent);
-			if (!attr_path)
-				break;
-			if (sscanf(attr_path, "%i:%i:%i:%" SCNu64,
-				   &pp->sg_id.host_no,
-				   &pp->sg_id.channel,
-				   &pp->sg_id.scsi_id,
-				   &pp->sg_id.lun) == 4)
-				break;
-		}
-		parent = udev_device_get_parent(parent);
-	}
-	if (!attr_path || pp->sg_id.host_no == -1)
-		return;
-
-	if (get_vpd_sysfs(parent, 0x80, pp->serial, SERIAL_SIZE) <= 0) {
-		if (get_serial(pp->serial, SERIAL_SIZE, pp->fd)) {
+	if (pp->serial[0] == '\0') {
+		if (get_serial(pp->serial, SERIAL_SIZE, pp->fd))
 			condlog(3, "%s: fail to get serial", pp->dev);
-			return;
-		}
+		else
+			condlog(3, "%s: serial = %s (ioctl)", pp->dev,
+				pp->serial);
 	}
-
-	condlog(3, "%s: serial = %s", pp->dev, pp->serial);
-	return;
 }
 
 static void
@@ -1974,30 +1955,29 @@ cciss_ioctl_pathinfo(struct path *pp)
 }
 
 int
-get_state (struct path * pp, struct config *conf, int daemon, int oldstate)
+start_checker (struct path * pp, struct config *conf, int daemon, int oldstate)
 {
 	struct checker * c = &pp->checker;
-	int state;
 
 	if (!checker_selected(c)) {
 		if (daemon) {
 			if (pathinfo(pp, conf, DI_SYSFS) != PATHINFO_OK) {
 				condlog(3, "%s: couldn't get sysfs pathinfo",
 					pp->dev);
-				return PATH_UNCHECKED;
+				return -1;
 			}
 		}
 		select_detect_checker(conf, pp);
 		select_checker(conf, pp);
 		if (!checker_selected(c)) {
 			condlog(3, "%s: No checker selected", pp->dev);
-			return PATH_UNCHECKED;
+			return -1;
 		}
 		checker_set_fd(c, pp->fd);
 		if (checker_init(c, pp->mpp?&pp->mpp->mpcontext:NULL)) {
 			checker_clear(c);
 			condlog(3, "%s: checker init failed", pp->dev);
-			return PATH_UNCHECKED;
+			return -1;
 		}
 	}
 	if (pp->mpp && !c->mpcontext)
@@ -2007,13 +1987,28 @@ get_state (struct path * pp, struct config *conf, int daemon, int oldstate)
 		checker_set_async(c);
 	else
 		checker_set_sync(c);
-	state = checker_check(c, oldstate);
-	condlog(3, "%s: %s state = %s", pp->dev,
+	checker_check(c, oldstate);
+	return 0;
+}
+
+int
+get_state (struct path * pp)
+{
+	struct checker * c = &pp->checker;
+	int state, lvl;
+
+	state = checker_get_state(c);
+
+	lvl = state == pp->oldstate || state == PATH_PENDING ? 4 : 3;
+	condlog(lvl, "%s: %s state = %s", pp->dev,
 		checker_name(c), checker_state_name(state));
 	if (state != PATH_UP && state != PATH_GHOST &&
 	    strlen(checker_message(c)))
-		condlog(3, "%s: %s checker%s",
+		condlog(lvl, "%s: %s checker%s",
 			pp->dev, checker_name(c), checker_message(c));
+	if (state != PATH_PENDING)
+		pp->oldstate = state;
+
 	return state;
 }
 
@@ -2043,8 +2038,7 @@ get_prio (struct path * pp)
 	old_prio = pp->priority;
 	pp->priority = prio_getprio(p, pp);
 	if (pp->priority < 0) {
-		/* this changes pp->offline, but why not */
-		int state = path_offline(pp);
+		int state = path_sysfs_state(pp);
 
 		if (state == PATH_DOWN || state == PATH_PENDING) {
 			pp->priority = old_prio;
@@ -2252,7 +2246,7 @@ static ssize_t uid_fallback(struct path *pp, int path_state,
 	return len;
 }
 
-bool has_uid_fallback(struct path *pp)
+static bool has_uid_fallback(const struct path *pp)
 {
 	/*
 	 * Falling back to direct WWID determination is dangerous
@@ -2271,6 +2265,16 @@ bool has_uid_fallback(struct path *pp)
 		(pp->bus == SYSFS_BUS_CCW &&
 		 (!strcmp(pp->uid_attribute, DEFAULT_DASD_UID_ATTRIBUTE) ||
 		  !strcmp(pp->uid_attribute, ""))));
+}
+
+bool can_recheck_wwid(const struct path *pp)
+{
+	/*
+	 * check_path_wwid_change() only works for scsi devices, and it
+	 * is only guaranteed to give the same WWID if the path uses
+	 * the default uid_attribute
+	 */
+	return (pp->bus == SYSFS_BUS_SCSI && has_uid_fallback(pp));
 }
 
 int
@@ -2330,6 +2334,7 @@ get_uid (struct path * pp, int path_state, struct udev_device *udev,
 int pathinfo(struct path *pp, struct config *conf, int mask)
 {
 	int path_state;
+	bool need_serial_recheck = false;
 
 	if (!pp || !conf)
 		return PATHINFO_FAILED;
@@ -2369,6 +2374,10 @@ int pathinfo(struct path *pp, struct config *conf, int mask)
 			   conf->elist_devnode,
 			   pp->dev) > 0)
 		return PATHINFO_SKIPPED;
+
+	if (pp->mpp && pp->mpp->pgpolicyfn == (pgpolicyfn *)group_by_serial &&
+	    pp->serial[0] == '\0')
+		need_serial_recheck = true;
 
 	condlog(4, "%s: mask = 0x%x", pp->dev, mask);
 
@@ -2415,7 +2424,7 @@ int pathinfo(struct path *pp, struct config *conf, int mask)
 			return PATHINFO_SKIPPED;
 	}
 
-	path_state = path_offline(pp);
+	path_state = path_sysfs_state(pp);
 	if (path_state == PATH_REMOVED)
 		goto blank;
 	else if (mask & DI_NOIO) {
@@ -2428,6 +2437,8 @@ int pathinfo(struct path *pp, struct config *conf, int mask)
 			    pp->state == PATH_UNCHECKED ||
 			    pp->state == PATH_WILD)
 				pp->chkrstate = pp->state = path_state;
+		if (need_serial_recheck && pp->serial[0] != '\0')
+			pp->mpp->need_reload = true;
 		return PATHINFO_OK;
 	}
 
@@ -2443,18 +2454,30 @@ int pathinfo(struct path *pp, struct config *conf, int mask)
 		goto blank;
 	}
 
-	if (mask & DI_SERIAL)
-		get_geometry(pp);
-
-	if (path_state == PATH_UP && pp->bus == SYSFS_BUS_SCSI)
-		scsi_ioctl_pathinfo(pp, mask);
-
-	if (pp->bus == SYSFS_BUS_CCISS && mask & DI_SERIAL)
-		cciss_ioctl_pathinfo(pp);
+	if (mask & DI_IOCTL || pp->ioctl_info == IOCTL_INFO_SKIPPED) {
+		if (path_state == PATH_UP) {
+			get_geometry(pp);
+			if (pp->bus == SYSFS_BUS_SCSI)
+				scsi_ioctl_pathinfo(pp);
+			else if (pp->bus == SYSFS_BUS_CCISS)
+				cciss_ioctl_pathinfo(pp);
+			pp->ioctl_info = IOCTL_INFO_COMPLETED;
+		} else if (pp->ioctl_info == IOCTL_INFO_NOT_REQUESTED)
+			pp->ioctl_info = IOCTL_INFO_SKIPPED;
+	}
 
 	if (mask & DI_CHECKER) {
 		if (path_state == PATH_UP) {
-			int newstate = get_state(pp, conf, 0, path_state);
+			int newstate = PATH_UNCHECKED;
+			if (start_checker(pp, conf, 0, path_state) == 0) {
+				if (checker_need_wait(&pp->checker)) {
+					struct timespec wait = {
+						.tv_nsec = 1000 * 1000,
+					};
+					nanosleep(&wait, NULL);
+				}
+				newstate = get_state(pp);
+			}
 			if (newstate != PATH_PENDING ||
 			    pp->state == PATH_UNCHECKED ||
 			    pp->state == PATH_WILD)
@@ -2525,6 +2548,8 @@ int pathinfo(struct path *pp, struct config *conf, int mask)
 
 	if ((mask & DI_ALL) == DI_ALL)
 		pp->initialized = INIT_OK;
+	if (need_serial_recheck && pp->serial[0] != '\0')
+		pp->mpp->need_reload = true;
 	return PATHINFO_OK;
 
 blank:

@@ -1,18 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
   Copyright (c) 2018 Martin Wilck, SUSE Linux GmbH
-
-  This program is free software; you can redistribute it and/or
-  modify it under the terms of the GNU General Public License
-  as published by the Free Software Foundation; either version 2
-  of the License, or (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include "nvme-lib.h"
@@ -548,7 +536,7 @@ struct udev_device *get_ctrl_blkdev(const struct context *ctx,
 	pthread_cleanup_push(_udev_enumerate_unref, enm);
 	if (udev_enumerate_add_match_parent(enm, ctrl) < 0)
 		goto out;
-	if (udev_enumerate_add_match_subsystem(enm, "block"))
+	if (udev_enumerate_add_match_subsystem(enm, "block") < 0)
 		goto out;
 
 	if (udev_enumerate_scan_devices(enm) < 0) {
@@ -675,7 +663,8 @@ static void _find_controllers(struct context *ctx, struct nvme_map *map)
 	pthread_cleanup_push_cast(free_scandir_result, &sr);
 	for (i = 0; i < r; i++) {
 		char *fn = di[i]->d_name;
-		struct udev_device *ctrl, *udev;
+		struct udev_device *ctrl;
+		struct udev_device *udev __attribute__((cleanup(cleanup_udev_device))) = NULL;
 
 		if (safe_snprintf(pathbuf + n, sizeof(pathbuf) - n, "/%s", fn))
 			continue;
@@ -719,11 +708,11 @@ static void _find_controllers(struct context *ctx, struct nvme_map *map)
 			continue;
 
 		path->gen.ops = &nvme_path_ops;
-		path->udev = udev;
+		path->udev = steal_ptr(udev);
 		path->seen = true;
 		path->map = map;
 		path->ctl = udev_device_get_parent_with_subsystem_devtype
-			(udev, "nvme", NULL);
+			(path->udev, "nvme", NULL);
 		if (path->ctl == NULL) {
 			condlog(1, "%s: %s: failed to get controller for %s",
 				__func__, THIS, fn);
@@ -744,7 +733,7 @@ static void _find_controllers(struct context *ctx, struct nvme_map *map)
 		}
 		vector_set_slot(&map->pgvec, &path->pg);
 		condlog(3, "%s: %s: new path %s added to %s",
-			__func__, THIS, udev_device_get_sysname(udev),
+			__func__, THIS, udev_device_get_sysname(path->udev),
 			udev_device_get_sysname(map->udev));
 	}
 	pthread_cleanup_pop(1);

@@ -14,19 +14,15 @@
 #include "mpath_pr_ioctl.h"
 #include "mpath_persist.h"
 #include "unaligned.h"
-
 #include "debug.h"
 #include "structs.h" /* FILE_NAME_SIZE */
+#include "mpath_persist_int.h"
 
 #define TIMEOUT 2000
 #define MAXRETRY 5
 
-int prin_do_scsi_ioctl(char * dev, int rq_servact, struct prin_resp *resp, int noisy);
-int mpath_translate_response (char * dev, struct sg_io_hdr io_hdr,
-			      SenseData_t *Sensedata);
-void dumpHex(const char* str, int len, int no_ascii);
-int prout_do_scsi_ioctl( char * dev, int rq_servact, int rq_scope,
-		unsigned int rq_type, struct prout_param_descriptor *paramp, int noisy);
+int mpath_translate_response(char *dev, struct sg_io_hdr io_hdr,
+			     SenseData_t *Sensedata);
 uint32_t  format_transportids(struct prout_param_descriptor *paramp);
 void convert_be32_to_cpu(uint32_t *num);
 void convert_be16_to_cpu(uint16_t *num);
@@ -52,7 +48,7 @@ int prout_do_scsi_ioctl(char * dev, int rq_servact, int rq_scope,
 	fd = open(devname, O_RDONLY);
 	if(fd < 0){
 		condlog (1, "%s: unable to open device.", dev);
-		return MPATH_PR_FILE_ERROR;
+		return MPATH_PR_RETRYABLE_ERROR;
 	}
 
 	unsigned char cdb[MPATH_PROUT_CMDLEN] =
@@ -107,7 +103,7 @@ retry :
 	{
 		condlog(0, "%s: ioctl failed %d", dev, ret);
 		close(fd);
-		return ret;
+		return MPATH_PR_OTHER;
 	}
 
 	condlog(4, "%s: Duration=%u (ms)", dev, io_hdr.duration);
@@ -123,14 +119,17 @@ retry :
 		goto retry;
 	}
 
-	if (((status == MPATH_PR_SENSE_NOT_READY )&& (Sensedata.ASC == 0x04)&&
-				(Sensedata.ASCQ == 0x07))&& (retry > 0))
-	{
-		usleep(1000);
-		--retry;
-		condlog(3, "%s: retrying for sense 02/04/07."
-			" Remaining retries = %d", dev, retry);
-		goto retry;
+	if (status == MPATH_PR_SENSE_NOT_READY) {
+		if (Sensedata.ASC == 0x04 && Sensedata.ASCQ == 0x07 && retry > 0) {
+			usleep(1000);
+			--retry;
+			condlog(3,
+				"%s: retrying for sense 02/04/07."
+				" Remaining retries = %d",
+				dev, retry);
+			goto retry;
+		} else
+			status = MPATH_PR_RETRYABLE_ERROR;
 	}
 
 	close(fd);
@@ -342,7 +341,7 @@ int prin_do_scsi_ioctl(char * dev, int rq_servact, struct prin_resp * resp, int 
 	fd = open(devname, O_RDONLY);
 	if(fd < 0){
 		condlog(0, "%s: Unable to open device ", dev);
-		return MPATH_PR_FILE_ERROR;
+		return MPATH_PR_RETRYABLE_ERROR;
 	}
 
 	if (mpath_mx_alloc_len)
@@ -488,7 +487,7 @@ int mpath_translate_response (char * dev, struct sg_io_hdr io_hdr,
 	case DID_OK :
 		break;
 	default :
-		return MPATH_PR_OTHER;
+		return MPATH_PR_RETRYABLE_ERROR;
 	}
 	switch(io_hdr.driver_status)
 	{

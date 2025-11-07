@@ -314,6 +314,15 @@ enum recheck_wwid_states {
 	RECHECK_WWID_ON = YNU_YES,
 };
 
+enum check_path_states {
+	CHECK_PATH_UNCHECKED,
+	CHECK_PATH_STARTED,
+	CHECK_PATH_CHECKED,
+	CHECK_PATH_NEW_UP,
+	CHECK_PATH_SKIPPED,
+	CHECK_PATH_REMOVED,
+};
+
 struct vpd_vendor_page {
 	int pg;
 	const char *name;
@@ -344,6 +353,12 @@ struct hd_geometry {
 
 #define GROUP_ID_UNDEF -1
 
+enum ioctl_info_states {
+	IOCTL_INFO_NOT_REQUESTED = 0,
+	IOCTL_INFO_SKIPPED,
+	IOCTL_INFO_COMPLETED,
+};
+
 struct path {
 	char dev[FILE_NAME_SIZE];
 	char dev_t[BLK_DEV_SIZE];
@@ -362,10 +377,11 @@ struct path {
 	unsigned int tick;
 	unsigned int pending_ticks;
 	int bus;
-	int offline;
+	int sysfs_state;
 	int state;
 	int dmstate;
 	int chkrstate;
+	int oldstate;
 	int failcount;
 	int priority;
 	int pgindex;
@@ -395,22 +411,36 @@ struct path {
 	int fast_io_fail;
 	unsigned int dev_loss;
 	int eh_deadline;
-	bool is_checked;
+	enum check_path_states is_checked;
 	bool can_use_env_uid;
+	bool add_when_online;
 	unsigned int checker_timeout;
 	/* configlet pointers */
 	vector hwe;
 	struct gen_path generic_path;
 	int tpg_id;
+	enum ioctl_info_states ioctl_info;
 };
 
 typedef int (pgpolicyfn) (struct multipath *, vector);
 
+enum pr_value {
+	PR_UNKNOWN,
+	PR_UNSET,
+	PR_SET,
+};
 
-enum prflag_value {
-	PRFLAG_UNKNOWN,
-	PRFLAG_UNSET,
-	PRFLAG_SET,
+enum prio_update_type {
+	PRIO_UPDATE_NONE,
+	PRIO_UPDATE_NORMAL,
+	PRIO_UPDATE_NEW_PATH,
+	PRIO_UPDATE_MARGINAL,
+};
+
+enum udev_wait_states {
+	UDEV_WAIT_DONE = 0,
+	UDEV_WAIT_STARTED,
+	UDEV_WAIT_RELOAD,
 };
 
 struct multipath {
@@ -424,7 +454,7 @@ struct multipath {
 	int bestpg;
 	int queuedio;
 	int action;
-	int wait_for_udev;
+	enum udev_wait_states wait_for_udev;
 	int uev_wait_tick;
 	int pgfailback;
 	int failback_tick;
@@ -450,12 +480,12 @@ struct multipath {
 	int max_sectors_kb;
 	int force_readonly;
 	int force_udev_reload;
-	int needs_paths_uevent;
 	int ghost_delay;
 	int ghost_delay_tick;
 	int queue_mode;
 	unsigned int sync_tick;
-	int synced_count;
+	int checker_count;
+	enum prio_update_type prio_update;
 	uid_t uid;
 	gid_t gid;
 	mode_t mode;
@@ -490,9 +520,13 @@ struct multipath {
 	/* persistent management data*/
 	int prkey_source;
 	struct be64 reservation_key;
+	struct be64 old_pr_key;
 	uint8_t sa_flags;
 	int prflag;
+	int prhold;
 	int all_tg_pt;
+	bool ever_registered_pr;
+
 	struct gen_multipath generic_mp;
 	bool fpin_must_reload;
 };
@@ -513,7 +547,6 @@ static inline int san_path_check_enabled(const struct multipath *mpp)
 }
 
 struct pathgroup {
-	long id;
 	int status;
 	int priority;
 	int enabled_paths;
@@ -580,7 +613,6 @@ struct path *mp_find_path_by_devt(const struct multipath *mpp, const char *devt)
 int pathcount (const struct multipath *, int);
 int count_active_paths(const struct multipath *);
 int count_active_pending_paths(const struct multipath *);
-int pathcmp (const struct pathgroup *, const struct pathgroup *);
 int add_feature (char **, const char *);
 int remove_feature (char **, const char *);
 

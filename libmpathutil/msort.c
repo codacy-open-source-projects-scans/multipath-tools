@@ -1,20 +1,8 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 /* An alternative to qsort, with an identical interface.
    This file is part of the GNU C Library.
    Copyright (C) 1992-2022 Free Software Foundation, Inc.
-
-   The GNU C Library is free software; you can redistribute it and/or
-   modify it under the terms of the GNU Lesser General Public
-   License as published by the Free Software Foundation; either
-   version 2.1 of the License, or (at your option) any later version.
-
-   The GNU C Library is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-   Lesser General Public License for more details.
-
-   You should have received a copy of the GNU Lesser General Public
-   License along with the GNU C Library; if not, see
-   <https://www.gnu.org/licenses/>.  */
+ */
 
 #include <alloca.h>
 #include <stdint.h>
@@ -259,8 +247,11 @@ msort_r (void *b, size_t n, size_t s, __compar_d_fn_t cmp, void *arg)
  * If this is safe for them, it should be for us, too.
  */
 #pragma GCC diagnostic push
-#if __GNUC__ >= 8
+#if __GNUC__ >= 8 || __clang_major__ >= 19
 #pragma GCC diagnostic ignored "-Wcast-function-type"
+#endif
+#if __clang_major__ >= 19
+#pragma GCC diagnostic ignored "-Wcast-function-type-mismatch"
 #endif
 void
 msort (void *b, size_t n, size_t s, __compar_fn_t cmp)

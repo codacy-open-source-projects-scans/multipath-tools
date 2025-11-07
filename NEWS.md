@@ -1,5 +1,262 @@
 # multipath-tools Release Notes
 
+## Stable branches and new versioning scheme
+
+Beginning with 0.11, the second digit in the multipath-tools version will be
+used for upstream "major" releases. The 3rd and last digit will denote stable
+releases in the future, containing only bug fixes on top of the last major
+release. These bug fixes will be tracked in stable branches.
+
+See [README.md](README.md) for additional information.
+
+## multipath-tools 0.13.0, 2025/10
+
+### Major rework of the SCSI Persistent Reservation code
+
+The mpathpersist code had many areas where it did a poor job of
+mimicking the behavior of setting up persistent reservations on an
+individual device, especially if some paths to the multipath device
+were missing or unusable.
+
+Issues improved in this release:
+
+* Persistent reservation operations in cases where the reservation
+  is held held by an unavailable path. For example, when such a key
+  is unregistered, libmpathpersist now preempts the old key
+  after verifying that the multipath device is holding the reservation.
+* Releasing a reservation held by an unavailable path. This has always
+  had code to handle it, but it relied on optional Persistent
+  Reservation features. The new code preempts the key and then restores
+  the removed registered keys while the device is suspended.
+* Handling removal of keys from paths that were down when the multipath
+  device was unregistered.
+* Changing how conflicts on key registration are handled. Instead of
+  the old rollback method (which was broken anyway),
+  libmpathpersist now retries with REGISTER AND IGNORE as long as the
+  REGISTER command completed successfully down some of the paths.
+* Changing when the reservation key is set to fix corner cases on
+  failure and registration while paths are coming up.
+* Retrying to fix corner cases when a path is coming up while doing a
+  reserve, preempt or clear.
+* Allowing registrations to succeed when there are retryable errors,
+  if the paths are actually down.
+* Fixing the reservation key validation in some commands.
+* Handling a race condition that may occur while changing the reservation key
+  of a multipath map.
+* Handling preemption of registrations of type "all registrants".
+
+In the course of making these changes, a number of corner cases were fixed,
+too. Please consult the commit messages for details.
+
+### Other changes
+
+* Updates to the built-in hardware table:
+  - add some NVMe storage array (VASTData, Infinidat, HITACHI VSP)
+  - add QSAN
+  - add EqualLogic PS
+
+## multipath-tools 0.12.0, 2025/08
+
+### User-visible changes
+
+* Besides the abstract unix socket (default:
+  `@/org/kernel/linux/storage/multipathd`), multipathd now also listens
+  on a unix pathname socket (default: `/run/multipathd.socket`). This makes it
+  possible to communicate with multipathd from a container in which the
+  named socket is bind-mounted. See **multipathd.8** for details.
+  Both sockets can also be received from systemd if socket activation is used
+  (not recommended for multipathd).
+  Fixes [#111](https://github.com/opensvc/multipath-tools/issues/111).
+  Commits f421a43 ff.
+* multipathd now sets the `port_state` of Fibre Channel remote ports to
+  "marginal" for NVMe devices, too. Note that unlike SCSI, this will not
+  directly affect the kernel NVMe driver's behavior. Marginal state will
+  affect path grouping on multipathd's part, though.
+  This change is only effective if dm-multipath is used for NVMe devices
+  (i.e. the kernel parameter `nvme_core.multipath=N` is in use).
+  Commit 30fc3e9.
+* Improved the communication with **udev** and **systemd** by triggering
+  uevents when path devices are added to or removed from multipath maps,
+  or when `multipathd reconfigure` is executed after changing blacklist
+  directives in `multipath.conf`.
+  Fixes [#103](https://github.com/opensvc/multipath-tools/issues/103). 
+  Commits 98b3a7b, ad3ea47, d9c6133, 272808c f.
+* Maps that were added outside of multipathd (e.g. using the **multipath**
+  command) and that couldn't be reloaded by multipathd used to be ignored
+  by multipathd. multipathd will now monitor them. If some paths were
+  offline while the map was created, multipathd will now add them to the
+  map when they go online again. Commit 9038d25 ff.
+* multipathd retries persistent reservation commands that have failed on one
+  path on another one. Commit d1106c8.
+
+### Other major changes
+
+* Continued cleanup of the path checker loop. The various cases in which
+  maps need to be reloaded are now handled more cleanly in the new
+  function `checker_finished()`. Map deletions don't happen any more
+  inside the checker loop, simplifying the code flow. `checker_finished()`
+  now also takes care of all actions that multipath was doing in scheduled
+  intervals ("ticks"). Commit 0ff1191 ff.
+
+### Bug fixes
+
+* Fix multipathd crash because of invalid path group index value, for example
+  if an invalid path device was removed from a map.
+  Fixes [#105](https://github.com/opensvc/multipath-tools/issues/105).
+  This issue existed since 0.4.5. Commit cd912cf.
+* Make sure maps are reloaded in the path checker loop after detecting an
+  inconsistent or wrong kernel state (e.g. missing or falsely mapped path
+  device). Wrongly mapped paths will be unmapped and released to the system.
+  Fixes another issue reported in
+  [#105](https://github.com/opensvc/multipath-tools/issues/105).
+  Commit 340e74d.
+* Fix the problem that, if a path device is added while offline, path grouping
+  may be wrong if `path_grouping_policy` is set to `group_by_serial` or
+  `group_by_tpg`, even if the path comes online later.
+  Fixes [#108](https://github.com/opensvc/multipath-tools/issues/108).
+  This problem has existed since 0.4.5. Commits c20fb70, 70c1724.
+* Fix compilation issue with musl libc on ppc64le and s390x. Fixes #112.
+  Commit 439044b
+* Fix the problem that `group_by_tpg` might be disabled if one or more
+  paths were offline during initial configuration.
+  This problem exists since 0.9.6. Commit b47a577.
+* Fix the problem that if a map was scheduled to be reloaded already,
+  `max_sectors_kb` might not be set on a path device that
+  was being added to a multipath map. This problem was introduced in 0.9.9.
+  Commit f5c0c4b.
+* Fix possible misdetection of changed pathgroups in a map.
+  This (minor) problem was introduced in 0.5.0. Commit d4b35f6.
+* Avoid a possible system hang during shutdown with queueing multipath maps,
+  which was introduced in 0.8.8. Commit ee062a0.
+* Failed paths should be checked every `polling_interval`. In certain cases,
+  this wouldn't happen, because the check interval wasn't reset by multipathd.
+  Commit 21c21bf.
+* It could happen that multipathd would accidentally release a SCSI persistent
+  reservation held by another node. Fix it. Commit 8d5f4a5.
+* After manually failing some paths and then reinstating them, sometimes
+  the reinstated paths were immediately failed again by multipathd.
+  Commit f1c5200.
+* Fix crash in foreign (nvme native multipath) code, present since 0.8.8.
+  Commit 9b1d721.
+* Fix file descriptor leak in kpartx. This problem existed since 0.4.5.
+  Commit 1757dbb.
+* Fix memory leak in error code path in libmpathpersist which existed
+  since 0.4.9. Commit b7fd205.
+* Fix possible out-of-bounds memory access in vector code that existed
+  since 0.4.9. Commit 2480d57.
+* Fix a possible NULL dereference in the iet prioritizer, existing since
+  0.4.9. Commit 01996d5.
+* Fix misspelled gcc option "-std". Commit f9fb65f.
+* Fix error code path for "multipathd show devices".
+  Problem existed since 0.8.5. Commits 4f0f43f, 5c59d5d.
+* Fix an error check in the nvme foreign library, problem introduced in 0.7.8.
+  Commit 66408f1.
+
+### Other changes
+
+* Cleanup and improvement of the path discovery code that uses ioctls to
+  detect device properties. Commits 6b91bfb ff.
+* Fix CI with cmocka 1.1.8 and newer. Fixes #117. Commit 6686b8f.
+* Updates to the built-in hardware table:
+  - Add Quantum devices
+  - Enable ALUA for AStor/NeoSapphire
+  - Update NFINIDAT/InfiniBox config
+  - Fix product blacklist of S/390 devices
+  - Add Seagate Lyve
+  - Add HITACHI VSP One SDS Block
+* Man page updates.
+* Updates to GitHub workflows.
+* Replace FSF licenses with SPDX-License-Identifier.
+
+## multipath-tools 0.11.0, 2024/11
+
+### User-visible changes
+
+* Modified the systemd unit `multipathd.service` such that multipathd will now
+  restart after a failure or crash.
+  Fixes [#100](https://github.com/opensvc/multipath-tools/issues/100).
+* Logging changes for verbosity level 3:
+  - silenced logging of path status if the status is unchanged
+  - silenced some unhelpful messages from scanning of existing maps
+  - added a message when partition mappings are removed.
+
+### Other major changes
+
+#### Rework of the path checking algorithm
+
+This is a continuation of the checker-related work that went into 0.10.0. For
+asynchronous checker algorithms (i.e. tur and directio), the start of the
+check and the retrieval of the results are done at separate points in time,
+which reduces the time for waiting for the checker results of individual paths
+and thus strongly improves the performance of the checker algorithm, in
+particular on systems with a large a amount of paths.
+
+The algorithm has the following additional properties:
+
+1. multipath devices get synchronized with the kernel occasionally, even if
+they have not paths
+2. If multiple paths from a multipath device are checked in the same
+loop, the multipath device will only get synchronized with the kernel once.
+3. All the paths of a multipath device will converge to being checked at
+the same time (at least as much as their differing checker intervals  will
+allow).
+4. The times for checking the paths of each multipath device will spread
+out as much as possible so multipathd doesn't do all of it's checking in
+a burst.
+5. path checking is done by multipath device (for initialized paths,
+the uninitialized paths are handled after all the adopted paths are
+handled).
+
+### Bug fixes
+
+* Fixed the problem that multipathd wouldn't start on systems with certain types
+  of device mapper devices, in particular devices with multiple DM targets.
+  The problem was introduced in 0.10.0.
+  Fixes [#102](https://github.com/opensvc/multipath-tools/issues/102).
+* Fixed a corner case in the udev rules which could cause a device not to be
+  activated during boot if a cold plug uevent is processed for a previously
+  not configured multipath map while this map was suspended. This problem existed
+  since 0.9.8.
+* Fixed the problem that devices with `no_path_retry fail` and no setting
+  for `dev_loss_tmo` might get the `dev_loss_tmo` set to 0, causing the
+  device to be deleted immediately in the event of a transport disruption.
+  This bug was introduced in 0.9.6.
+* Fixed the problem that, if there were multiple maps with deferred failback
+  (`failback` value > 0 in `multipath.conf`), some maps might fail back later
+  than configured. The problem existed since 0.9.6.
+* Fixed handling of empty maps, i.e. multipath maps that have a multipath UUID
+  but don't contain a device-mapper table. Such maps can occur in very rare
+  cases if some device-mapper operation has failed, or if a tool has been
+  killed in the process of map creation. multipathd will now detect such
+  cases, and either remove these maps or reload them as appropriate.
+* During map creation, fixed the case where a map with different name, but
+  matching UUID and matching type was already present. multipathd
+  previously failed to set up such maps. Now it will reload them with the
+  correct content.
+* Fixed the logic for enabling the systemd watchdog (`WatchdogSec=` in the
+  systemd unit file for multipathd).
+* Fixed a memory leak in the nvme foreign library. The bug existed since
+  0.7.8.
+* Fixed a problem in the marginal path detection algorithm that could cause
+  the io error check for a recently failed path to be delayed. This bug
+  existed since 0.7.4.
+
+### Other
+
+* Default settings for `hardware_handler` have been removed from the
+  internal hardware table. These settings have been obsoleted by the Linux
+  kernel 4.3 and later, which automatically selects hardware handlers when
+  SCSI devices are added. See the notes about `SCSI_DH_MODULES_PRELOAD` in
+  [README.md](README.md).
+* Added a hardware table entry for the SCSI Target Subsystem for Linux (SCST).
+* The text of the licenses has been updated to the latest versions from the
+  Free Software Foundation.
+
+### Internal
+
+* `libmp_mapinfo()` now fills in the `name`, `uuid`, and `dmi` fields
+  if requested by the caller, even if it encounters an error or an empty map.
+
 ## multipath-tools 0.10.0, 2024/08
 
 ### User-Visible Changes

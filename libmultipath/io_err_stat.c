@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * (C) Copyright HUAWEI Technology Corp. 2017, All Rights Reserved.
  *
@@ -7,8 +8,6 @@
  * IO error stream statistic process for path failure event from kernel
  *
  * Author(s): Guan Junxiong 2017 <guanjunxiong@huawei.com>
- *
- * This file is released under the GPL version 2, or any later version.
  */
 
 #include <unistd.h>
@@ -367,7 +366,8 @@ int need_io_err_check(struct path *pp)
 		return 1;
 	get_monotonic_time(&curr_time);
 	if ((curr_time.tv_sec - pp->io_err_dis_reinstate_time) >
-	    pp->mpp->marginal_path_err_recheck_gap_time) {
+	    pp->mpp->marginal_path_err_recheck_gap_time ||
+            pp->io_err_dis_reinstate_time == 0) {
 		io_err_stat_log(4, "%s: reschedule checking after %d seconds",
 				pp->dev,
 				pp->mpp->marginal_path_err_recheck_gap_time);
